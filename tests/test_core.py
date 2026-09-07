@@ -218,3 +218,23 @@ def test_convert_equations_true_default_still_runs_math_pipeline():
         for call in mock_provider.complete_sync.call_args_list
     )
     assert saw_math_prompt, "default equations=True must still issue math prompts"
+
+
+def test_convert_equations_false_leaves_unicode_math_unwrapped():
+    """``equations=False`` must also skip the Unicode→LaTeX rewrite. Batch
+    consumers that opt out of equations expect plain prose; ``$...\\alpha$``
+    markup leaking into figure captions is unrenderable downstream."""
+    import pdfvault
+
+    doc = pdfvault.convert(_generate_math_pdf(), tier="fast", verify=False, equations=False)
+
+    assert "$" not in doc.markdown
+    assert "\\nabla" not in doc.markdown
+
+
+def test_convert_equations_default_still_wraps_unicode_math_on_fast_tier():
+    import pdfvault
+
+    doc = pdfvault.convert(_generate_math_pdf(), tier="fast", verify=False)
+
+    assert "$" in doc.markdown

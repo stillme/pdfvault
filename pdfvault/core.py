@@ -318,10 +318,14 @@ def convert(
         "markdown": detect_superscripts(doc.markdown),
     })
 
-    # Math enhancement (all tiers): convert Unicode math symbols to LaTeX
-    doc = doc.model_copy(update={
-        "markdown": convert_unicode_math(doc.markdown),
-    })
+    # Math enhancement (all tiers): convert Unicode math symbols to LaTeX.
+    # Honour ``equations=False`` here too — callers that opt out expect plain
+    # prose, and ``$...\alpha$`` wrappers leaking into figure legends are
+    # unrenderable for downstream consumers.
+    if config.equations:
+        doc = doc.model_copy(update={
+            "markdown": convert_unicode_math(doc.markdown),
+        })
 
     # VLM enhancement for STANDARD and DEEP tiers
     effective_tier_enum = config.tier
