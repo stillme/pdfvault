@@ -101,6 +101,20 @@ _RUN_OF_SPACES_RE = re.compile(r" {3,}")
 _RUN_OF_BLANK_LINES_RE = re.compile(r"(?:[ \t]*\n){3,}")
 
 
+# pdfplumber starts a new word when the gap between two glyphs exceeds
+# ``x_tolerance`` (default 3pt, absolute). Typeset journals position words by
+# offset rather than emitting space glyphs, and at legend sizes (7-8pt) a word
+# gap is only ~2pt — so the default glued every word of every Nature / Cell
+# figure legend together ("BlockingBMPsignalinginvitro"). Scaling the
+# tolerance to the glyph size keeps body text intact and restores legend spaces.
+WORD_GAP_TOLERANCE_RATIO = 0.15
+
+
+def _extract_layout_text(page) -> str:
+    """``extract_text(layout=True)`` with a font-relative word-gap tolerance."""
+    return page.extract_text(layout=True, x_tolerance_ratio=WORD_GAP_TOLERANCE_RATIO) or ""
+
+
 def _normalize_layout_whitespace(text: str) -> str:
     if not text:
         return text
@@ -238,25 +252,130 @@ def _extract_text_with_columns(page) -> str:
     Multi-column pages are cropped per-column and concatenated in
     reading order (left to right). Within each column we still use
     ``layout=True`` so vertical line order is preserved.
+
+    Pages are first cut into horizontal *bands* wherever the dominant
+    type size changes between two-column regions (see
+    ``_type_size_bands``). Nature-style pages set a figure legend in two
+    columns of 7-8pt type above two columns of body text; cropping the
+    whole page into columns reads left-legend, left-body, right-legend,
+    right-body and cuts the legend in half. Reading band by band keeps
+    the legend contiguous and ahead of the body.
     """
     boundaries = _detect_column_boundaries(page)
     if not boundaries:
-        return _normalize_layout_whitespace(page.extract_text(layout=True) or "")
+        return _normalize_layout_whitespace(_extract_layout_text(page))
 
+    bands = _type_size_bands(page, boundaries[0])
+    if len(bands) <= 1:
+        return _columns_text(page, boundaries)
+
+    band_texts: list[str] = []
+    for top, bottom in bands:
+        try:
+            region = page.crop((0.0, top, float(page.width), bottom))
+        except Exception:
+            continue
+        # A short legend band rarely has enough words for its own column
+        # detection; the page-level boundary applies to it just the same.
+        region_boundaries = _detect_column_boundaries(region) or boundaries
+        text = _columns_text(region, region_boundaries)
+        if text.strip():
+            band_texts.append(text)
+    return "\n\n".join(band_texts)
+
+
+def _columns_text(page, boundaries: list[float]) -> str:
+    """Crop ``page`` at ``boundaries`` and concatenate the columns left to right."""
     # bbox is (x0, top, x1, bottom). Build [0, b1, b2, ..., width].
-    edges = [0.0] + boundaries + [float(page.width)]
+    edges = [0.0] + list(boundaries) + [float(page.width)]
     column_texts: list[str] = []
     for i in range(len(edges) - 1):
-        bbox = (edges[i], 0.0, edges[i + 1], float(page.height))
+        bbox = (edges[i], float(page.bbox[1]), edges[i + 1], float(page.bbox[3]))
         try:
             cropped = page.crop(bbox)
-            text = cropped.extract_text(layout=True) or ""
+            text = _extract_layout_text(cropped)
         except Exception:
             text = ""
         text = _normalize_layout_whitespace(text)
         if text.strip():
             column_texts.append(text)
     return "\n\n".join(column_texts)
+
+
+# Lines whose ``top`` differs by less than this are the same visual line.
+_LINE_TOP_TOLERANCE_PT = 2.0
+# A band must have at least this many lines *and* text on both sides of the
+# column boundary; anything smaller (a heading, a stray label) is folded into
+# its neighbour so a left-column subheading cannot chop the right column.
+_MIN_BAND_LINES = 2
+
+
+def _type_size_bands(page, boundary: float) -> list[tuple[float, float]]:
+    """Return (top, bottom) bands where the dominant glyph size changes.
+
+    Empty list (or a single band) means the page reads fine as one block.
+    """
+    try:
+        chars = [c for c in page.chars if str(c.get("text", "")).strip()]
+    except Exception:
+        return []
+    if not chars:
+        return []
+
+    chars.sort(key=lambda c: (float(c["top"]), float(c["x0"])))
+    lines: list[dict] = []
+    for ch in chars:
+        top, bottom = float(ch["top"]), float(ch["bottom"])
+        size = round(float(ch.get("size") or 0.0) * 2) / 2
+        center_x = (float(ch["x0"]) + float(ch["x1"])) / 2
+        if lines and abs(top - lines[-1]["top"]) <= _LINE_TOP_TOLERANCE_PT:
+            line = lines[-1]
+            line["bottom"] = max(line["bottom"], bottom)
+            line["sizes"][size] = line["sizes"].get(size, 0) + 1
+        else:
+            line = {"top": top, "bottom": bottom, "sizes": {size: 1}, "left": False, "right": False}
+            lines.append(line)
+        if center_x < boundary:
+            line["left"] = True
+        else:
+            line["right"] = True
+    for line in lines:
+        line["size"] = max(line["sizes"], key=line["sizes"].get)
+
+    runs: list[dict] = []
+    for line in lines:
+        if runs and runs[-1]["size"] == line["size"]:
+            runs[-1]["lines"].append(line)
+        else:
+            runs.append({"size": line["size"], "lines": [line]})
+
+    def qualifies(run: dict) -> bool:
+        return (
+            len(run["lines"]) >= _MIN_BAND_LINES
+            and any(l["left"] for l in run["lines"])
+            and any(l["right"] for l in run["lines"])
+        )
+
+    bands: list[dict] = []
+    for run in runs:
+        if bands and not qualifies(run):
+            bands[-1]["lines"].extend(run["lines"])
+        else:
+            bands.append(run)
+    if len(bands) > 1 and not qualifies(bands[0]):
+        bands[1]["lines"] = bands[0]["lines"] + bands[1]["lines"]
+        bands.pop(0)
+    if len(bands) <= 1:
+        return []
+
+    page_top, page_bottom = float(page.bbox[1]), float(page.bbox[3])
+    edges = [page_top]
+    for prev, nxt in zip(bands, bands[1:]):
+        prev_bottom = max(l["bottom"] for l in prev["lines"])
+        next_top = min(l["top"] for l in nxt["lines"])
+        edges.append((prev_bottom + next_top) / 2)
+    edges.append(page_bottom)
+    return list(zip(edges, edges[1:]))
 
 
 class PdfplumberExtractor:

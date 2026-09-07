@@ -458,3 +458,88 @@ def test_table_confidence_all_empty_bottoms_out():
     # Fully empty: ``_is_degenerate_table`` would catch it, but if it
     # ever leaked through, confidence must be ~0, not ~0.5.
     assert _table_confidence(headers, rows) <= 0.1
+
+
+def _make_small_font_pdf(font_size: float = 7.5) -> bytes:
+    """Single-column PDF set in legend-sized type.
+
+    Nature / Cell figure legends are set at 7-8pt where a word gap is about
+    2pt — below pdfplumber's default ``x_tolerance`` of 3pt, so every space
+    is swallowed unless the tolerance scales with the font.
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica", font_size)
+    lines = [
+        "Fig. 2 | Blocking BMP signaling in vitro does not affect YAP target gene",
+        "expression. a Schematic of the epithelial cell compartment in antral glands.",
+        "b Organoid treatment schematic. Scale bar: 100 um.",
+    ]
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    # Typeset journals position each word by offset rather than emitting a
+    # space glyph, so draw the words individually with a legend-sized gap.
+    gap = 0.28 * font_size
+    for i, line in enumerate(lines):
+        x = 50.0
+        y = 700 - i * (font_size + 2)
+        for word in line.split(" "):
+            c.drawString(x, y, word)
+            x += stringWidth(word, "Helvetica", font_size) + gap
+    c.save()
+    return buf.getvalue()
+
+
+def test_small_font_word_gaps_are_preserved():
+    text = PdfplumberExtractor().extract_page(_make_small_font_pdf(), 0).text
+    assert "Blocking BMP signaling in vitro does not affect" in text
+    assert "BlockingBMPsignaling" not in text
+
+
+def _make_two_column_pdf_with_two_column_legend() -> bytes:
+    """Two-column body above a two-column figure legend in smaller type.
+
+    Nature-style pages set the legend in two columns beneath the figure and
+    the body in two columns beneath that. Cropping the whole page into two
+    columns reads left-legend, left-body, right-legend, right-body — cutting
+    the legend in half. The legend band has to be read before the body band.
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    page_w, page_h = letter
+    left_x, right_x, top_y = 50.0, page_w / 2 + 30.0, page_h - 60.0
+    legend_left = [
+        "Fig. 1 | Downregulation of BMP signaling induces the",
+        "regenerative state. a Confocal images of antral tissue",
+    ]
+    legend_right = [
+        "from uninfected mice. b Quantification of KI67 positive",
+        "cells per gland (n = 3 mice per group). Scale bars: 100 um.",
+    ]
+    c.setFont("Helvetica", 7.5)
+    for i, (l, r) in enumerate(zip(legend_left, legend_right)):
+        c.drawString(left_x, top_y - i * 9.5, l)
+        c.drawString(right_x, top_y - i * 9.5, r)
+    c.setFont("Helvetica", 9)
+    body_top = top_y - 4 * 9.5 - 14
+    for i in range(20):
+        c.drawString(left_x, body_top - i * 12.0, f"LEFT-{i:02d} body text in the left column")
+        c.drawString(right_x, body_top - i * 12.0, f"RIGHT-{i:02d} body text in the right column")
+    c.save()
+    return buf.getvalue()
+
+
+def test_two_column_legend_is_read_as_one_band_before_the_body():
+    text = PdfplumberExtractor().extract_page(_make_two_column_pdf_with_two_column_legend(), 0).text
+    flat = " ".join(text.split())
+    legend = ("Fig. 1 | Downregulation of BMP signaling induces the regenerative state. "
+              "a Confocal images of antral tissue from uninfected mice. b Quantification of KI67 positive "
+              "cells per gland (n = 3 mice per group). Scale bars: 100 um.")
+    assert legend in flat
+    assert flat.index("LEFT-00") < flat.index("LEFT-19") < flat.index("RIGHT-00") < flat.index("RIGHT-19")

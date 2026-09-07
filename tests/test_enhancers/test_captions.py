@@ -312,3 +312,108 @@ def test_match_empty_captions():
     figures = [Figure(id="fig1", page=0)]
     result = match_captions_to_figures(figures, [])
     assert result[0].caption is None
+
+
+def test_caption_stops_at_cross_reference_to_another_figure():
+    """Column-cropped text has no blank line between a legend and the body
+    prose below it. Body prose cites *other* figures in parentheses; a legend
+    for Fig. 2 does not, so that is where the legend ends."""
+    md = "\n".join([
+        "Fig. 2 | Blocking BMP signaling. a Schematic of the model. b Organoid treatment schematic.",
+        "This effect was completely inhibited by BMP2 (Fig. 3c and Supplementary Fig. 5e).",
+        "Treating organoids with LPS showed similar results.",
+    ])
+    caps = extract_figure_captions(md)
+    assert len(caps) == 1
+    assert caps[0]["caption"] == "Blocking BMP signaling. a Schematic of the model. b Organoid treatment schematic."
+    assert caps[0]["end_line"] == 1
+
+
+def test_caption_stops_at_running_footer():
+    md = "\n".join([
+        "Fig. 4 | Stromal cells promote epithelial YAP activation.",
+        "Nature Communications | (2026) 17:9510 https://doi.org/10.1038/s41467-026-77520-1",
+        "Screening our in vivo transcriptome data for differentially expressed genes",
+    ])
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == "Stromal cells promote epithelial YAP activation."
+
+
+def test_caption_is_capped_at_max_length_on_a_sentence_boundary():
+    from pdfvault.enhancers.captions import MAX_CAPTION_CHARS
+
+    body = ["Fig. 1 | Downregulation of BMP signaling induces a regenerative state."]
+    body += [f"Body sentence number {i} continues the results without any blank line." for i in range(200)]
+    caps = extract_figure_captions("\n".join(body))
+    caption = caps[0]["caption"]
+    assert len(caption) <= MAX_CAPTION_CHARS
+    assert caption.endswith(".")
+    assert caption.startswith("Downregulation of BMP signaling")
+
+
+def test_caption_cut_before_other_figure_citation_within_one_line():
+    """Paragraph reflow can merge legend and body into one physical line;
+    the boundary must still be found inside the line."""
+    md = ("Fig. 2 | Blocking BMP signaling. a Schematic of the model. b Organoid treatment schematic. "
+          "This effect was completely inhibited by BMP2 (Fig. 3c and Supplementary Fig. 5e). Treating organoids showed similar results.")
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == "Blocking BMP signaling. a Schematic of the model. b Organoid treatment schematic."
+
+
+def test_caption_cut_before_running_footer_within_one_line():
+    md = ("Fig. 4 | Stromal cells promote epithelial YAP activation. Scale bars: 100 µm. "
+          "Nature Communications | (2026) 17:9510 https://doi.org/10.1038/s41467-026-77520-1 Screening our data")
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == "Stromal cells promote epithelial YAP activation. Scale bars: 100 µm."
+
+
+def test_caption_keeps_references_to_its_own_figure_and_supplementary_figures():
+    md = "Fig. 2 | Quantification of panel (Fig. 2a) as in (Supplementary Fig. 5d). n = 3 mice per group."
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == "Quantification of panel (Fig. 2a) as in (Supplementary Fig. 5d). n = 3 mice per group."
+
+
+def test_caption_continues_across_blank_line_when_mid_sentence():
+    """A two-column legend arrives as left column, blank line, right column.
+    A legend never ends mid-sentence, so an unterminated caption keeps
+    going past the blank line; a terminated one still stops there."""
+    md = "\n".join([
+        "Fig. 1 | Downregulation of BMP signaling. a, b Confocal images of KI67 (a) and",
+        "",
+        "GSII (b) in antral tissue (n = 3 mice per group). Scale bars: 100 µm.",
+        "",
+        "We also analyzed the Lgr5+ stem cell signature and found that it was unchanged.",
+    ])
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == (
+        "Downregulation of BMP signaling. a, b Confocal images of KI67 (a) and "
+        "GSII (b) in antral tissue (n = 3 mice per group). Scale bars: 100 µm."
+    )
+    assert caps[0]["end_line"] == 3
+
+
+def test_caption_skips_running_footer_and_continues_when_mid_sentence():
+    md = "\n".join([
+        "Fig. 1 | Downregulation of BMP signaling. a GSEA of uninfected Bmpr1a KO vs WT mice, for",
+        "https://doi.org/10.1038/s41467-026-77520-1",
+        "",
+        "YAP target gene signature (h) (n = 2 mice per group). Scale bars: 100 µm.",
+        "",
+        "We also analyzed the Lgr5+ stem cell signature.",
+    ])
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == (
+        "Downregulation of BMP signaling. a GSEA of uninfected Bmpr1a KO vs WT mice, for "
+        "YAP target gene signature (h) (n = 2 mice per group). Scale bars: 100 µm."
+    )
+    assert "doi.org" not in caps[0]["caption"]
+
+
+def test_caption_backs_up_to_sentence_boundary_when_body_line_stops_it():
+    md = "\n".join([
+        "Fig. 2 | Blocking BMP signaling. a Schematic of the model. Organoids grown in standard medium",
+        "strongly upregulated cytokines upon treatment (Fig. 3c and Supplementary Fig. 5e).",
+        "Treating organoids with LPS showed similar results.",
+    ])
+    caps = extract_figure_captions(md)
+    assert caps[0]["caption"] == "Blocking BMP signaling. a Schematic of the model."

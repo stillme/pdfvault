@@ -13,6 +13,28 @@ _NEXT_PAGE_CAPTION_RE = re.compile(
 _FIGURE_MARKER_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _CAPTION_HEADER_RE = re.compile(r"^(?:Extended Data\s+)?Fig\.\s+\d+\s+\|")
 
+#: Upper bound on an accumulated legend. Real legends top out around 2,500
+#: characters; anything longer is body prose that leaked in because the
+#: column-cropped text had no blank line separating legend from body.
+MAX_CAPTION_CHARS = 3000
+
+# Body prose cites *other* figures in parentheses ("(Fig. 3c and
+# Supplementary Fig. 5e)"); a legend describes only its own figure. The
+# first continuation line that cross-references a different main figure
+# therefore marks the end of the legend.
+# "(Supplementary Fig. 5d)" is legitimate legend text and must not match,
+# hence the reference has to open the parenthesis (optionally after "see").
+_PAREN_FIGURE_XREF_RE = re.compile(
+    r"\(\s*(?:see\s+(?:also\s+)?)?(?P<extended>Extended Data\s+)?Fig(?:ure)?s?\.?\s*(?P<num>\d+)",
+    re.IGNORECASE,
+)
+# Running footers of the form "Nature Communications | (2026) 17:9510
+# https://doi.org/10.1038/..." are page furniture, never legend text.
+_RUNNING_FOOTER_RE = re.compile(
+    r"https?://doi\.org/\S+|\|\s*\(\s*\d{4}\s*\)\s*\d+\s*:\s*\d+",
+    re.IGNORECASE,
+)
+
 
 def extract_figure_captions(markdown: str) -> list[dict]:
     """Extract figure captions/legends from markdown text.
@@ -58,6 +80,8 @@ def extract_figure_captions(markdown: str) -> list[dict]:
             # - A section heading (## ...)
             # - End of text
             j = i + 1
+            accumulated = len(caption_parts[0])
+            stopped_on_prose = False
             while j < len(lines):
                 next_line = lines[j].strip()
                 # Stop at next figure caption header
@@ -66,13 +90,56 @@ def extract_figure_captions(markdown: str) -> list[dict]:
                 # Stop at section headings
                 if heading_re.match(next_line):
                     break
-                # Stop at blank line
+                # Stop at blank line — unless the legend is mid-sentence.
+                # A two-column legend arrives as left column, blank line,
+                # right column; legends never end without punctuation, so
+                # an unterminated caption continues past the blank.
                 if not next_line:
+                    if _ends_sentence(" ".join(caption_parts)):
+                        break
+                    k = j + 1
+                    while k < len(lines) and not lines[k].strip():
+                        k += 1
+                    if k >= len(lines):
+                        break
+                    resume = lines[k].strip()
+                    if (
+                        header_re.match(resume)
+                        or heading_re.match(resume)
+                        or _RUNNING_FOOTER_RE.search(resume)
+                        or _cites_other_figure(resume, fig_num, is_extended)
+                    ):
+                        break
+                    j = k
+                    continue
+                # A running footer marks the bottom of the physical column.
+                # It is never legend text: drop it, and carry on only when
+                # the legend is still mid-sentence (it continues in the next
+                # column); a terminated legend ends here.
+                if _RUNNING_FOOTER_RE.search(next_line):
+                    if _ends_sentence(" ".join(caption_parts)):
+                        break
+                    j += 1
+                    continue
+                # Stop where body prose begins
+                if _cites_other_figure(next_line, fig_num, is_extended):
+                    stopped_on_prose = True
+                    break
+                # Stop when the legend has clearly run into the body
+                if accumulated + 1 + len(next_line) > MAX_CAPTION_CHARS:
                     break
                 caption_parts.append(next_line)
+                accumulated += 1 + len(next_line)
                 j += 1
 
-            caption_text = " ".join(caption_parts)
+            caption_text = _cut_at_body_prose(" ".join(caption_parts), fig_num, is_extended)
+            if stopped_on_prose and not _ends_sentence(caption_text):
+                # The body paragraph started on an earlier line; drop the
+                # partial sentence that belongs to it.
+                boundary = caption_text.rfind(". ")
+                if boundary > 0:
+                    caption_text = caption_text[: boundary + 1]
+            caption_text = _trim_to_sentence(caption_text, MAX_CAPTION_CHARS)
 
             full_match = lines[i].strip()
 
@@ -89,6 +156,58 @@ def extract_figure_captions(markdown: str) -> list[dict]:
             i += 1
 
     return captions
+
+
+def _cites_other_figure(line: str, fig_num: int, is_extended: bool) -> bool:
+    """True when ``line`` cross-references a figure other than ``fig_num``
+    inside parentheses — the signature of body prose, not legend text."""
+    for match in _PAREN_FIGURE_XREF_RE.finditer(line):
+        if bool(match.group("extended")) != is_extended:
+            continue
+        if int(match.group("num")) != fig_num:
+            return True
+    return False
+
+
+def _ends_sentence(text: str) -> bool:
+    return bool(text) and text.rstrip()[-1:] in '.!?:"\')'
+
+
+def _cut_at_body_prose(text: str, fig_num: int, is_extended: bool) -> str:
+    """Cut ``text`` where body prose or page furniture begins *inside* a line.
+
+    Paragraph reflow upstream can merge a legend with the body paragraph that
+    follows it into one physical line, so the line-level stops are not enough.
+    The cut backs up to the sentence boundary before the offending span.
+    """
+    cut_at: int | None = None
+    footer = _RUNNING_FOOTER_RE.search(text)
+    if footer:
+        cut_at = footer.start()
+    for match in _PAREN_FIGURE_XREF_RE.finditer(text):
+        if bool(match.group("extended")) != is_extended:
+            continue
+        if int(match.group("num")) != fig_num:
+            cut_at = match.start() if cut_at is None else min(cut_at, match.start())
+            break
+    if cut_at is None:
+        return text
+    boundary = text.rfind(". ", 0, cut_at)
+    if boundary <= 0:
+        return text[:cut_at].rstrip()
+    return text[: boundary + 1].rstrip()
+
+
+def _trim_to_sentence(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` characters, cutting back to the last full
+    sentence so a truncated legend never ends mid-clause."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    boundary = max(cut.rfind(". "), cut.rfind(".\n"))
+    if boundary > 0:
+        return cut[: boundary + 1].rstrip()
+    return cut.rstrip()
 
 
 def extract_panel_references(markdown: str) -> list[dict]:
