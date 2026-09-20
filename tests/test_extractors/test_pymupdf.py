@@ -188,3 +188,72 @@ def test_vector_fallback_skips_pages_with_qualifying_raster():
         f"page with qualifying raster should produce exactly one figure, "
         f"got {len(figures)}"
     )
+
+
+def _make_text_band_with_icons_pdf() -> bytes:
+    """A page of body prose whose only vector marks are inline link icons.
+
+    Journals such as eLife draw a small vector glyph beside every inline
+    citation link. Those glyphs push the page over the vector-drawing
+    threshold, and clustering then spans the whole paragraph, so the
+    fallback renders a picture of body text and calls it a figure.
+    """
+    from io import BytesIO
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica", 10)
+    for row in range(26):
+        y = 700 - row * 10
+        c.drawString(72, y, "inserting a LacZ cassette into the Slap gene, beta-galactosidase activity was")
+        # Six tiny link glyphs per line, sitting inside the text band.
+        for k in range(6):
+            x = 90 + k * 60
+            c.rect(x, y, 4, 4, stroke=1, fill=0)
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _make_title_block_pdf() -> bytes:
+    """A journal cover block: title, authors, a logo and rule bars.
+
+    Roughly half of the region is text and the rest is branding, which
+    is why a pure text-coverage rule alone does not settle it.
+    """
+    from io import BytesIO
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    # Logo: a block of small filled squares, plus full-width rule bars
+    # above and below the title so the cluster spans the page.
+    for i in range(12):
+        for j in range(10):
+            c.rect(72 + j * 5, 730 + i * 4, 4, 3, stroke=0, fill=1)
+    c.rect(72, 772, 468, 2, stroke=0, fill=1)
+    c.rect(72, 648, 468, 2, stroke=0, fill=1)
+    c.setFont("Helvetica", 16)
+    c.drawString(150, 740, "Slap restricts oncogenic Src-family kinase")
+    c.drawString(150, 720, "signaling to maintain colonic homeostasis")
+    c.setFont("Helvetica", 9)
+    for row in range(6):
+        c.drawString(150, 700 - row * 11, "Dana Naim, Zouheir Houhou, Florent Cauchois, Kevin Espie, Valerie Simon")
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_vector_fallback_rejects_a_body_text_band():
+    from pdfvault.extractors.pymupdf_ext import PymupdfExtractor
+    figures = PymupdfExtractor().extract_figures(_make_text_band_with_icons_pdf())
+    assert figures == [], "a paragraph of prose with inline link glyphs is not a figure"
+
+
+def test_vector_fallback_rejects_a_title_block():
+    from pdfvault.extractors.pymupdf_ext import PymupdfExtractor
+    figures = PymupdfExtractor().extract_figures(_make_title_block_pdf())
+    assert figures == [], "the article title block is not a figure"

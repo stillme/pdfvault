@@ -44,6 +44,20 @@ _FIGURE_VERTICAL_GAP_PT = 30.0
 # drawings that we don't want to render.
 _MIN_FIGURE_AREA_PT2 = 20_000
 
+#: A vector cluster is rejected once this much of its area is covered by the
+#: page's text blocks. Measured on real papers: genuine vector figures score
+#: 0.00-0.05 (their axis labels are drawn as outlined paths, and even real
+#: text labels cover only a sliver), whereas body-text bands and journal
+#: cover blocks score 0.40-1.00. 0.35 sits in the gap with margin on both
+#: sides.
+_MAX_TEXT_COVERAGE = 0.35
+
+#: Banner geometry. Inline link glyphs and rule bars cluster into wide, flat
+#: strips that carry almost no text of their own. Real figures measured
+#: 400-611pt tall; these strips measured 40-170pt.
+_BANNER_MIN_ASPECT = 6.0
+_BANNER_MAX_HEIGHT_PT = 120.0
+
 # Pixmap render DPI for vector figure regions. 150 DPI matches the
 # resolution our VLM page renderer uses elsewhere — high enough for
 # Sonnet/Haiku to read axis labels, low enough not to bloat output.
@@ -120,7 +134,10 @@ def _extract_vector_figures(page, page_idx: int) -> list[dict]:
 
     figures: list[dict] = []
     matrix = pymupdf.Matrix(_VECTOR_FIGURE_DPI / 72, _VECTOR_FIGURE_DPI / 72)
+    text_rects = _text_block_rects(page)
     for bbox in bboxes:
+        if not _is_figure_region(bbox, text_rects):
+            continue
         try:
             clip = pymupdf.Rect(*bbox)
             pix = page.get_pixmap(matrix=matrix, clip=clip)
@@ -134,6 +151,63 @@ def _extract_vector_figures(page, page_idx: int) -> list[dict]:
             "height": pix.height,
         })
     return figures
+
+
+def _text_block_rects(page) -> list:
+    """Bounding boxes of the page's text blocks, for figure/text separation."""
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:
+        return []
+    rects = []
+    for block in blocks:
+        try:
+            rect = pymupdf.Rect(block[:4])
+        except Exception:
+            continue
+        if not rect.is_empty:
+            rects.append(rect)
+    return rects
+
+
+def _text_coverage(bbox, text_rects: list) -> float:
+    """Fraction of ``bbox`` covered by text blocks, clamped to 1.
+
+    Blocks can overlap, so the summed intersection is an upper bound on the
+    true covered area. That bias is safe here: it only ever makes a region
+    look *more* like text, and the decision margin is wide.
+    """
+    region = pymupdf.Rect(*bbox)
+    area = abs(region.get_area())
+    if area <= 0:
+        return 1.0
+    covered = 0.0
+    for rect in text_rects:
+        overlap = rect & region
+        if not overlap.is_empty:
+            covered += abs(overlap.get_area())
+    return min(covered / area, 1.0)
+
+
+def _is_figure_region(bbox, text_rects: list) -> bool:
+    """Whether a vector cluster is a figure rather than page furniture.
+
+    The fallback clusters *every* vector drawing on a page, so inline link
+    glyphs drag in the surrounding paragraph and a masthead's rule bars drag
+    in the article title. Rendering those produced pictures of body text that
+    downstream caption matching then labelled with a real figure's legend.
+    """
+    region = pymupdf.Rect(*bbox)
+    if _text_coverage(bbox, text_rects) >= _MAX_TEXT_COVERAGE:
+        return False
+    height = abs(region.height)
+    if (
+        height < _BANNER_MAX_HEIGHT_PT
+        and height > 0
+        and abs(region.width) / height >= _BANNER_MIN_ASPECT
+    ):
+        return False
+    return True
 
 
 def _is_bold_span(span: dict) -> bool:
